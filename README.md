@@ -3,15 +3,16 @@ Badly named prototype of Manifold.
 
 ## Architecture
 
-In a way, ManiPt acts as a load balancer on top of Consul. It relies on
+In a way, ManiPt acts as a cluster of apps on top of Consul. It relies on
 Consul (and by extension, the Raft consensus protocol) to select a
-leader node will handle connections. The slave nodes will also handle
-connections, but will proxy them to the leader node chosen. In case any
-node goes down, there are others to pick up the slack.
+leader node will handle connections to these apps. The slave nodes will also
+handle connections, but will proxy them to the leader node chosen. In case any
+node goes down, there are others to pick up the slack until the new leader is
+chosen.
 
 The difference from a load balancer is that we don't transition between
 different nodes to handle each request. We always forward to the leader,
-and let the Raft protocol handle switching leaders.
+and let Consul handle switching leaders.
 
 ## Projected Usage
 
