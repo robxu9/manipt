@@ -1,6 +1,16 @@
 # ManiPt
 Badly named prototype of Manifold.
 
+## Testing this... thing
+
+Grab this with `go get -u github.com/robxu9/manipt`, and then run with
+`manipt -h` for help options.
+
+General usage is `manipt fromport:toport:protocol fromport:toport:protocol ..`,
+where `fromport` is the port that clients will connect to, `toport` is the
+actual app internally, and `protocol` is the communication protocol (e.g.
+tcp or udp).
+
 ## Architecture
 
 In a way, ManiPt acts as a cluster of apps on top of Consul. It relies on

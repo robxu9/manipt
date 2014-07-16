@@ -15,7 +15,7 @@ const (
 )
 
 var (
-	AgentWaitTime = time.ParseDuration("10m")
+	AgentWaitTime = time.Duration(10) * time.Second
 )
 
 type IncomingConn struct {
@@ -35,7 +35,7 @@ type Agent struct {
 	connchan   chan *IncomingConn
 }
 
-func NewAgent(c *consulapi.Client) {
+func NewAgent(c *consulapi.Client) *Agent {
 	return &Agent{
 		Client:     c,
 		Leader:     nil,
@@ -63,14 +63,17 @@ func (a *Agent) proxyConns(l net.Listener) {
 }
 
 func (a *Agent) Run() {
+	var incoming *IncomingConn
 	for {
-		incoming := <-a.connchan
+
+		if incoming != nil {
+			incoming = <-a.connchan
+		}
 
 		select {
 		case node := <-a.leaderchan:
 			a.Leader = node
 			log.Printf("[info] new leader detected: %s", node)
-			fallthrough
 		default:
 			// handle update
 			_, port, err := net.SplitHostPort(incoming.ListenerAddr.String())
@@ -85,6 +88,7 @@ func (a *Agent) Run() {
 			} else {
 				go a.proxyTo(port, incoming, a.Leader)
 			}
+			incoming = nil
 		}
 	}
 }
@@ -105,27 +109,27 @@ func (a *Agent) proxyLocal(port string, conn *IncomingConn) {
 		return
 	}
 
-	proxy, err := net.Dial(conn.ListenerAddr.Network(), "localhost:"+port)
+	proxy, err := net.Dial(conn.ListenerAddr.Network(), "localhost:"+strconv.Itoa(local))
 	if err != nil {
 		log.Printf("[err] failed to dial local port; dropping incoming conn from %s: %s", conn.ListenerAddr, err)
 		conn.Connection.Close()
 		return
 	}
 
-	go proxyStream(conn.Connection, proxy)
-	go proxyStream(proxy, conn.Connection)
+	go a.proxyStream(conn.Connection, proxy)
+	go a.proxyStream(proxy, conn.Connection)
 }
 
 func (a *Agent) proxyTo(port string, conn *IncomingConn, to *consulapi.Node) {
 	proxy, err := net.Dial(conn.ListenerAddr.Network(), to.Address+":"+port)
 	if err != nil {
 		log.Printf("[err] failed to proxy to leader, doing local proxy instead: %s", err)
-		proxyLocal(port, conn)
+		a.proxyLocal(port, conn)
 		return
 	}
 
-	go proxyStream(conn.Connection, proxy)
-	go proxyStream(proxy, conn.Connection)
+	go a.proxyStream(conn.Connection, proxy)
+	go a.proxyStream(proxy, conn.Connection)
 }
 
 func (a *Agent) proxyStream(from, to net.Conn) {
@@ -159,17 +163,22 @@ func (a *Agent) LeaderUpdater() {
 		if err != nil {
 			log.Fatalf("[fatal] failed to create session in consul: %s", err)
 		}
+		a.Session = str
 	}
 
 	var lastindex uint64
 
 	kv := a.Client.KV()
 	for {
-		res, meta, err := kv.Acquire(&consulapi.KVPair{
+		res, _, err := kv.Acquire(&consulapi.KVPair{
 			Key:     MANIPT_KEY,
 			Value:   []byte(nodename),
 			Session: a.Session,
 		}, nil)
+
+		if err != nil {
+			log.Fatalf("[fatal] couldn't contact consul for acquiring lock: %s", err)
+		}
 
 		if res {
 			// we're leader!
@@ -178,10 +187,15 @@ func (a *Agent) LeaderUpdater() {
 
 		for {
 			// who's leader? let's check
-			pair, meta, err := kv.Get(MANIPT_KEY, &QueryOptions{
+			pair, meta, err := kv.Get(MANIPT_KEY, &consulapi.QueryOptions{
 				WaitIndex: lastindex,
 				WaitTime:  AgentWaitTime,
 			})
+
+			if err != nil {
+				log.Printf("[err] failed to get kv for current leader node: %s", err)
+				break
+			}
 
 			if pair.Session == "" {
 				// whoever was no longer is
