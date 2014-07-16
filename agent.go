@@ -1,4 +1,4 @@
-package manipt
+package main
 
 import (
 	"io"
@@ -8,6 +8,10 @@ import (
 	"time"
 
 	"github.com/armon/consul-api"
+)
+
+const (
+	MANIPT_KEY = "service/manipt/leader"
 )
 
 var (
@@ -22,6 +26,8 @@ type IncomingConn struct {
 type Agent struct {
 	Client *consulapi.Client
 	Leader *consulapi.Node
+
+	Session string
 
 	PortMap map[int]int // proxy our listener port to app port (for local)
 
@@ -142,72 +148,60 @@ func (a *Agent) proxyStream(from, to net.Conn) {
 }
 
 func (a *Agent) LeaderUpdater() {
-	var lastindex uint64
 
-	self, err := a.Client.Agent().Self()
+	nodename, err := a.Client.Agent().NodeName()
 	if err != nil {
-		log.Fatalf("[fatal] can't get information about self agent: %s", err)
+		log.Fatalf("[fatal] can't get our own node name: %s", err)
 	}
 
-	selfhost := self["Member"]["Addr"].(string)
-	selfport := self["Member"]["Port"].(int)
-
-	catalog := a.Client.Catalog()
-	for {
-		nodes, meta, err := catalog.Nodes(&QueryOptions{
-			WaitIndex: lastindex,
-			WaitTime:  AgentWaitTime,
-		})
-
+	if a.Session == "" {
+		str, _, err := a.Client.Session().Create(nil, nil)
 		if err != nil {
-			log.Printf("[err] failed to get catalogue: %s", err)
+			log.Fatalf("[fatal] failed to create session in consul: %s", err)
+		}
+	}
+
+	var lastindex uint64
+
+	kv := a.Client.KV()
+	for {
+		res, meta, err := kv.Acquire(&consulapi.KVPair{
+			Key:     MANIPT_KEY,
+			Value:   []byte(nodename),
+			Session: a.Session,
+		}, nil)
+
+		if res {
+			// we're leader!
+			a.leaderchan <- nil
 		}
 
-		if !meta.KnownLeader {
-			// let's handle it then
-			a.leaderchan <- nil
-		} else {
-			if lastindex == meta.LastIndex {
-				// nothing's changed
-				continue
+		for {
+			// who's leader? let's check
+			pair, meta, err := kv.Get(MANIPT_KEY, &QueryOptions{
+				WaitIndex: lastindex,
+				WaitTime:  AgentWaitTime,
+			})
+
+			if pair.Session == "" {
+				// whoever was no longer is
+				// so we're going to try getting it
+				break
+			}
+
+			if string(pair.Value) != nodename { // non-leaders
+				// find this person
+				catalog := a.Client.Catalog()
+				node, _, err := catalog.Node(string(pair.Value), nil)
+				if err != nil {
+					log.Printf("[err] failed to get current leader node: %s", err)
+					continue
+				}
+				a.leaderchan <- node.Node // send new leader off
 			}
 
 			lastindex = meta.LastIndex
-
-			leader, err := a.Client.Status().Leader()
-			if err != nil {
-				log.Printf("[err] failed to get leader: %s", err)
-			}
-
-			host, port, err := net.SplitHostPort(leader)
-			if err != nil {
-				log.Printf("[err] bad response from leader? str: %s, err: %s", leader, err)
-			}
-
-			if host == selfhost && port == selfport {
-				// we're the leader
-				a.leaderchan <- nil
-				continue
-			}
-
-			found := false
-
-			for _, v := range nodes {
-				if v.Address == host {
-					// we got our leader node
-					a.leaderchan <- v
-					found = true
-					break
-				}
-			}
-
-			if found {
-				continue
-			}
-
-			// we couldn't find a leader node?
-			log.Printf("[err] couldn't find leader %s in our catalogue, assuming no known leader", leader)
-			a.leaderchan <- nil
 		}
 	}
+
 }
