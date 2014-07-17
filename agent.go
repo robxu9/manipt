@@ -4,7 +4,9 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/armon/consul-api"
@@ -18,118 +20,121 @@ var (
 	AgentWaitTime = time.Duration(10) * time.Second
 )
 
-type IncomingConn struct {
-	ListenerAddr net.Addr
-	Connection   net.Conn
-}
-
 type Agent struct {
+	sync.RWMutex
+
 	Client *consulapi.Client
 	Leader *consulapi.Node
 
+	Bind string
+	Port int
+
+	Listener net.Listener
+	Server   *http.Server
+
+	IsServing bool
+
 	Session string
 
-	PortMap map[int]int // proxy our listener port to app port (for local)
-
 	leaderchan chan *consulapi.Node
-	connchan   chan *IncomingConn
+	connchan   chan net.Conn
+	closechan  chan struct{}
 }
 
-func NewAgent(c *consulapi.Client) *Agent {
+func NewAgent(c *consulapi.Client, bind string, port int, server *http.Server) *Agent {
 	return &Agent{
 		Client:     c,
 		Leader:     nil,
+		Bind:       bind,
+		Port:       port,
+		Server:     server,
 		leaderchan: make(chan *consulapi.Node),
+		connchan:   make(chan net.Conn),
+		closechan:  make(chan struct{}),
 	}
 }
 
-func (a *Agent) AddListener(rport, lport int, l net.Listener) {
-	a.PortMap[rport] = lport
-	go a.proxyConns(l)
-}
-
-func (a *Agent) proxyConns(l net.Listener) {
+func (a *Agent) proxyConns() {
 	for {
-		c, err := l.Accept()
+		c, err := a.Listener.Accept()
 		if err != nil {
-			log.Printf("[err] failed to accept conn: %s", err)
-			continue
+			select {
+			case <-a.closechan:
+				return
+			default:
+				log.Printf("[err] failed to accept conn: %s", err)
+				continue
+			}
 		}
-		a.connchan <- &IncomingConn{
-			ListenerAddr: l.Addr(),
-			Connection:   c,
-		}
+		a.connchan <- c
 	}
+}
+
+func (a *Agent) resetListener() {
+	if a.Listener != nil {
+		a.Listener.Close()
+	}
+
+	listener, err := net.Listen("tcp", a.Bind+":"+strconv.Itoa(a.Port))
+	if err != nil {
+		log.Fatalf("[fatal] failed to bind to %s:%d", a.Bind, a.Port)
+	}
+	a.Listener = listener
 }
 
 func (a *Agent) Run() {
-	var incoming *IncomingConn
+	// set our Listener
+	a.resetListener()
+
+	// get the current status first
+	a.Leader = <-a.leaderchan
+
+	if a.Leader == nil { // so we're leader
+		// ask http server to start
+		log.Printf("[info] becoming leader")
+		go a.Server.Serve(a.Listener)
+	} else {
+		log.Printf("[info] becoming proxy")
+		go a.proxyConns()
+	}
+
 	for {
-
-		if incoming != nil {
-			incoming = <-a.connchan
-		}
-
 		select {
 		case node := <-a.leaderchan:
-			a.Leader = node
 			log.Printf("[info] new leader detected: %s", node)
-		default:
-			// handle update
-			_, port, err := net.SplitHostPort(incoming.ListenerAddr.String())
-			if err != nil {
-				log.Printf("[err] failed to handle incoming conn %s, dropping", incoming.ListenerAddr)
-				incoming.Connection.Close()
-				continue
+
+			if node == nil {
+				// we're becoming the leader
+				a.closechan <- struct{}{}
+				a.resetListener()
+
+				log.Printf("[info] becoming leader")
+				go a.Server.Serve(a.Listener)
+			} else if a.Leader == nil {
+				// we're no longer the leader
+				log.Printf("[info] becoming proxy")
+
+				a.resetListener()
+				go a.proxyConns()
 			}
 
-			if a.Leader == nil {
-				go a.proxyLocal(port, incoming)
-			} else {
-				go a.proxyTo(port, incoming, a.Leader)
-			}
-			incoming = nil
+			a.Leader = node
+		case incoming := <-a.connchan:
+			log.Printf("[info] proxying %s", incoming.RemoteAddr())
+			a.proxyTo(a.Leader, incoming)
 		}
 	}
 }
 
-func (a *Agent) proxyLocal(port string, conn *IncomingConn) {
-
-	iport, err := strconv.Atoi(port)
+func (a *Agent) proxyTo(to *consulapi.Node, conn net.Conn) {
+	proxy, err := net.Dial("tcp", to.Address+":"+strconv.Itoa(a.Port))
 	if err != nil {
-		log.Printf("[err] got strange port %s from incoming conn %s, dropping", port, conn.ListenerAddr)
-		conn.Connection.Close()
+		log.Printf("[err] failed to proxy to leader, will drop connection: %s", err)
 		return
 	}
 
-	local, ok := a.PortMap[iport]
-	if !ok {
-		log.Printf("[err] failed to map port %d, dropping incoming conn from %s", iport, conn.ListenerAddr)
-		conn.Connection.Close()
-		return
-	}
-
-	proxy, err := net.Dial(conn.ListenerAddr.Network(), "localhost:"+strconv.Itoa(local))
-	if err != nil {
-		log.Printf("[err] failed to dial local port; dropping incoming conn from %s: %s", conn.ListenerAddr, err)
-		conn.Connection.Close()
-		return
-	}
-
-	go a.proxyStream(conn.Connection, proxy)
-	go a.proxyStream(proxy, conn.Connection)
-}
-
-func (a *Agent) proxyTo(port string, conn *IncomingConn, to *consulapi.Node) {
-	proxy, err := net.Dial(conn.ListenerAddr.Network(), to.Address+":"+port)
-	if err != nil {
-		log.Printf("[err] failed to proxy to leader, doing local proxy instead: %s", err)
-		a.proxyLocal(port, conn)
-		return
-	}
-
-	go a.proxyStream(conn.Connection, proxy)
-	go a.proxyStream(proxy, conn.Connection)
+	go a.proxyStream(conn, proxy)
+	go a.proxyStream(proxy, conn)
 }
 
 func (a *Agent) proxyStream(from, to net.Conn) {
@@ -171,7 +176,7 @@ func (a *Agent) LeaderUpdater() {
 	kv := a.Client.KV()
 	for {
 		res, _, err := kv.Acquire(&consulapi.KVPair{
-			Key:     MANIPT_KEY,
+			Key:     MANIPT_KEY + "/" + strconv.Itoa(a.Port),
 			Value:   []byte(nodename),
 			Session: a.Session,
 		}, nil)
@@ -187,7 +192,7 @@ func (a *Agent) LeaderUpdater() {
 
 		for {
 			// who's leader? let's check
-			pair, meta, err := kv.Get(MANIPT_KEY, &consulapi.QueryOptions{
+			pair, meta, err := kv.Get(MANIPT_KEY+"/"+strconv.Itoa(a.Port), &consulapi.QueryOptions{
 				WaitIndex: lastindex,
 				WaitTime:  AgentWaitTime,
 			})
