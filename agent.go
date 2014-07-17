@@ -19,8 +19,8 @@ var (
 )
 
 type IncomingConn struct {
-	ListenerAddr net.Addr
-	Connection   net.Conn
+	Listener   *PortListener
+	Connection net.Conn
 }
 
 type Agent struct {
@@ -29,35 +29,40 @@ type Agent struct {
 
 	Session string
 
-	PortMap map[int]int // proxy our listener port to app port (for local)
+	Config *AgentConfig
 
 	leaderchan chan *consulapi.Node
 	connchan   chan *IncomingConn
 }
 
-func NewAgent(c *consulapi.Client) *Agent {
-	return &Agent{
+func NewAgent(c *consulapi.Client, bind string) *Agent {
+	a := &Agent{
 		Client:     c,
 		Leader:     nil,
 		leaderchan: make(chan *consulapi.Node),
+		connchan:   make(chan *IncomingConn),
 	}
+	a.Config = NewConfig(a, bind)
+	return a
 }
 
-func (a *Agent) AddListener(rport, lport int, l net.Listener) {
-	a.PortMap[rport] = lport
-	go a.proxyConns(l)
-}
-
-func (a *Agent) proxyConns(l net.Listener) {
+func (a *Agent) proxyConns(l *PortListener) {
 	for {
-		c, err := l.Accept()
+		c, err := l.Listener.Accept()
 		if err != nil {
-			log.Printf("[err] failed to accept conn: %s", err)
-			continue
+			select {
+			case <-l.quit:
+				log.Printf("[info] closing listener %s", l.Listener.Addr())
+				return
+			default:
+				log.Printf("[err] failed to accept conn: %s", err)
+				continue
+			}
 		}
+
 		a.connchan <- &IncomingConn{
-			ListenerAddr: l.Addr(),
-			Connection:   c,
+			Listener:   l,
+			Connection: c,
 		}
 	}
 }
