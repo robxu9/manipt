@@ -206,6 +206,10 @@ func (a *Agent) LeaderUpdater() {
 				// whoever was no longer is
 				// handle until we get a new leader
 				a.leaderchan <- nil
+				// set the last index
+				lastindex = meta.LastIndex
+				// wait for a moment (lockdelays)
+				time.Sleep(10 * time.Second)
 				// so we're going to try getting it
 				break
 			}
