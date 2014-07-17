@@ -204,6 +204,8 @@ func (a *Agent) LeaderUpdater() {
 
 			if pair.Session == "" {
 				// whoever was no longer is
+				// handle until we get a new leader
+				a.leaderchan <- nil
 				// so we're going to try getting it
 				break
 			}
