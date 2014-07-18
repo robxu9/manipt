@@ -23,8 +23,7 @@ type Agent struct {
 	Client *consulapi.Client
 	Leader *consulapi.Node
 
-	Bind string
-	Port int
+	Bind *net.TCPAddr
 
 	PubListener    *net.TCPListener
 	WebAppListener *net.TCPListener
@@ -38,11 +37,15 @@ type Agent struct {
 }
 
 func NewAgent(c *consulapi.Client, bind string, port int, server *http.Server) *Agent {
+	tcpaddr, err := net.ResolveTCPAddr("tcp", bind+":"+strconv.Itoa(port))
+	if err != nil {
+		panic(err)
+	}
+
 	return &Agent{
 		Client:     c,
 		Leader:     nil,
-		Bind:       bind,
-		Port:       port,
+		Bind:       tcpaddr,
 		Server:     server,
 		leaderchan: make(chan *consulapi.Node),
 		connchan:   make(chan *net.TCPConn, 1024),
@@ -62,14 +65,17 @@ func (a *Agent) proxyConns() {
 }
 
 func (a *Agent) setup() {
-	publisten, err := net.ListenTCP("tcp", a.Bind+":"+strconv.Itoa(a.Port))
+	publisten, err := net.ListenTCP("tcp", a.Bind)
 	if err != nil {
 		log.Fatalf("[fatal] failed to setup public listener")
 	}
 
 	a.PubListener = publisten
 
-	webapp, err := net.ListenTCP("tcp", "127.0.0.1:0")
+	webapp, err := net.ListenTCP("tcp", &net.TCPAddr{
+		IP:   net.IPv4(127, 0, 0, 1),
+		Port: 0,
+	})
 	if err != nil {
 		log.Fatalf("[fatal] failed to setup webapp listener")
 	}
@@ -86,6 +92,12 @@ func (a *Agent) Run() {
 	// get the current status first
 	a.Leader = <-a.leaderchan
 
+	if a.Leader == nil {
+		log.Printf("[info] starting as leader")
+	} else {
+		log.Printf("[info] starting as proxy to %s @ %s", a.Leader.Node, a.Leader.Address)
+	}
+
 	// start proxying connections
 	go a.proxyConns()
 
@@ -96,10 +108,8 @@ func (a *Agent) Run() {
 
 			if node == nil && a.Leader != nil {
 				log.Printf("[info] becoming leader")
-			} else if node != nil && a.Leader == nil {
-				log.Printf("[info] becoming proxy")
-			} else {
-				log.Printf("[info] no change")
+			} else if node != nil {
+				log.Printf("[info] becoming proxy to %s @ %s", node.Node, node.Address)
 			}
 
 			a.Leader = node
@@ -115,8 +125,8 @@ func (a *Agent) Run() {
 }
 
 func (a *Agent) proxyWebApp(conn *net.TCPConn) {
-	waddr := a.WebAppListener.Addr()
-	proxy, err := net.Dial(waddr.Network(), waddr.String())
+	waddr := a.WebAppListener.Addr().(*net.TCPAddr)
+	proxy, err := net.DialTCP("tcp", nil, waddr)
 	if err != nil {
 		log.Printf("[err] failed to send to webapp, dropping connection: %s", err)
 		conn.Close()
@@ -128,15 +138,20 @@ func (a *Agent) proxyWebApp(conn *net.TCPConn) {
 }
 
 func (a *Agent) proxyTo(to *consulapi.Node, conn *net.TCPConn) {
-	proxy, err := net.Dial("tcp", to.Address+":"+strconv.Itoa(a.Port))
+	proxy, err := net.Dial("tcp", to.Address+":"+strconv.Itoa(a.Bind.Port))
 	if err != nil {
 		log.Printf("[err] failed to proxy to leader, will drop connection: %s", err)
 		conn.Close()
 		return
 	}
 
-	go a.proxyStream(conn, proxy)
-	go a.proxyStream(proxy, conn)
+	tcpproxy, ok := proxy.(*net.TCPConn)
+	if !ok {
+		log.Fatalf("[fatal] assert failed - tcpproxy should be a *net.TCPConn")
+	}
+
+	go a.proxyStream(conn, tcpproxy)
+	go a.proxyStream(tcpproxy, conn)
 }
 
 func (a *Agent) proxyStream(from, to *net.TCPConn) {
@@ -180,7 +195,7 @@ func (a *Agent) LeaderUpdater() {
 	kv := a.Client.KV()
 	for {
 		res, _, err := kv.Acquire(&consulapi.KVPair{
-			Key:     MANIPT_KEY + "/" + strconv.Itoa(a.Port),
+			Key:     MANIPT_KEY + "/" + strconv.Itoa(a.Bind.Port),
 			Value:   []byte(nodename),
 			Session: a.Session,
 		}, nil)
@@ -196,7 +211,7 @@ func (a *Agent) LeaderUpdater() {
 
 		for {
 			// who's leader? let's check
-			pair, meta, err := kv.Get(MANIPT_KEY+"/"+strconv.Itoa(a.Port), &consulapi.QueryOptions{
+			pair, meta, err := kv.Get(MANIPT_KEY+"/"+strconv.Itoa(a.Bind.Port), &consulapi.QueryOptions{
 				WaitIndex: lastindex,
 				WaitTime:  AgentWaitTime,
 			})
