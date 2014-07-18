@@ -6,7 +6,6 @@ import (
 	"net"
 	"net/http"
 	"strconv"
-	"sync"
 	"time"
 
 	"github.com/armon/consul-api"
@@ -21,24 +20,21 @@ var (
 )
 
 type Agent struct {
-	sync.RWMutex
-
 	Client *consulapi.Client
 	Leader *consulapi.Node
 
 	Bind string
 	Port int
 
-	Listener net.Listener
-	Server   *http.Server
-
-	IsServing bool
+	PubListener    *net.TCPListener
+	WebAppListener *net.TCPListener
+	Server         *http.Server
 
 	Session string
 
 	leaderchan chan *consulapi.Node
-	connchan   chan net.Conn
-	closechan  chan struct{}
+	connchan   chan *net.TCPConn
+	proxychan  chan *net.TCPConn
 }
 
 func NewAgent(c *consulapi.Client, bind string, port int, server *http.Server) *Agent {
@@ -49,87 +45,81 @@ func NewAgent(c *consulapi.Client, bind string, port int, server *http.Server) *
 		Port:       port,
 		Server:     server,
 		leaderchan: make(chan *consulapi.Node),
-		connchan:   make(chan net.Conn),
-		closechan:  make(chan struct{}),
+		connchan:   make(chan *net.TCPConn, 1024),
+		proxychan:  make(chan *net.TCPConn, 1024),
 	}
 }
 
 func (a *Agent) proxyConns() {
 	for {
-		c, err := a.Listener.Accept()
+		c, err := a.PubListener.AcceptTCP()
 		if err != nil {
-			select {
-			case <-a.closechan:
-				return
-			default:
-				log.Printf("[err] failed to accept conn: %s", err)
-				continue
-			}
+			log.Printf("[err] failed to accept conn: %s", err)
+			continue
 		}
 		a.connchan <- c
 	}
 }
 
-func (a *Agent) resetListener() {
-	if a.Listener != nil {
-		a.Listener.Close()
+func (a *Agent) setup() {
+	publisten, err := net.ListenTCP("tcp", a.Bind+":"+strconv.Itoa(a.Port))
+	if err != nil {
+		log.Fatalf("[fatal] failed to setup public listener")
 	}
 
-	listener, err := net.Listen("tcp", a.Bind+":"+strconv.Itoa(a.Port))
+	a.PubListener = publisten
+
+	webapp, err := net.ListenTCP("tcp", "127.0.0.1:0")
 	if err != nil {
-		log.Fatalf("[fatal] failed to bind to %s:%d", a.Bind, a.Port)
+		log.Fatalf("[fatal] failed to setup webapp listener")
 	}
-	a.Listener = listener
+
+	a.WebAppListener = webapp
+
+	go a.Server.Serve(a.WebAppListener)
 }
 
 func (a *Agent) Run() {
 	// set our Listener
-	a.resetListener()
+	a.setup()
 
 	// get the current status first
 	a.Leader = <-a.leaderchan
 
-	if a.Leader == nil { // so we're leader
-		// ask http server to start
-		log.Printf("[info] becoming leader")
-		go a.Server.Serve(a.Listener)
-	} else {
-		log.Printf("[info] becoming proxy")
-		go a.proxyConns()
-	}
+	// start proxying connections
+	go a.proxyConns()
 
 	for {
 		select {
 		case node := <-a.leaderchan:
-			log.Printf("[info] new leader detected: %s", node)
+			log.Printf("[info] received leader node: %s", node)
 
-			if node == nil {
-				// we're becoming the leader
-				a.closechan <- struct{}{}
-				a.resetListener()
-
+			if node == nil && a.Leader != nil {
 				log.Printf("[info] becoming leader")
-				go a.Server.Serve(a.Listener)
-			} else if a.Leader == nil {
-				// we're no longer the leader
+			} else if node != nil && a.Leader == nil {
 				log.Printf("[info] becoming proxy")
-
-				a.resetListener()
-				go a.proxyConns()
+			} else {
+				log.Printf("[info] no change")
 			}
 
 			a.Leader = node
 		case incoming := <-a.connchan:
-			log.Printf("[info] proxying %s", incoming.RemoteAddr())
-			a.proxyTo(a.Leader, incoming)
+			if a.Leader != nil {
+				log.Printf("[info] proxying %s", incoming.RemoteAddr())
+				a.proxyTo(a.Leader, incoming)
+			} else {
+				a.proxyWebApp(incoming)
+			}
 		}
 	}
 }
 
-func (a *Agent) proxyTo(to *consulapi.Node, conn net.Conn) {
-	proxy, err := net.Dial("tcp", to.Address+":"+strconv.Itoa(a.Port))
+func (a *Agent) proxyWebApp(conn *net.TCPConn) {
+	waddr := a.WebAppListener.Addr()
+	proxy, err := net.Dial(waddr.Network(), waddr.String())
 	if err != nil {
-		log.Printf("[err] failed to proxy to leader, will drop connection: %s", err)
+		log.Printf("[err] failed to send to webapp, dropping connection: %s", err)
+		conn.Close()
 		return
 	}
 
@@ -137,15 +127,29 @@ func (a *Agent) proxyTo(to *consulapi.Node, conn net.Conn) {
 	go a.proxyStream(proxy, conn)
 }
 
-func (a *Agent) proxyStream(from, to net.Conn) {
+func (a *Agent) proxyTo(to *consulapi.Node, conn *net.TCPConn) {
+	proxy, err := net.Dial("tcp", to.Address+":"+strconv.Itoa(a.Port))
+	if err != nil {
+		log.Printf("[err] failed to proxy to leader, will drop connection: %s", err)
+		conn.Close()
+		return
+	}
+
+	go a.proxyStream(conn, proxy)
+	go a.proxyStream(proxy, conn)
+}
+
+func (a *Agent) proxyStream(from, to *net.TCPConn) {
 	for {
 		buf := make([]byte, 1024)
 		_, err := from.Read(buf)
 		if err != nil {
-			if err == io.EOF {
-				// we're done here
-				return
+			if err != io.EOF {
+				log.Printf("[err] error reading from %s to %s: %s", from, to, err)
 			}
+			from.CloseRead()
+			to.CloseWrite()
+			return
 		}
 
 		_, err = to.Write(buf)
