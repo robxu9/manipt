@@ -276,7 +276,7 @@ func (a *Agent) LeaderUpdater() {
 				// set the last index
 				lastindex = meta.LastIndex
 				// wait for a moment (lockdelays)
-				time.Sleep(10 * time.Second)
+				time.Sleep(1 * time.Second)
 				// so we're going to try getting it
 				break
 			}
