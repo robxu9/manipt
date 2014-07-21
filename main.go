@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 
 	"github.com/armon/consul-api"
@@ -62,6 +63,15 @@ func main() {
 	serv := &http.Server{}
 
 	agent := NewAgent(client, *bind, port, serv)
+
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt)
+	go func() {
+		<-c
+		agent.Quit()
+		log.Printf("[main] exiting")
+		os.Exit(1)
+	}()
 
 	go agent.LeaderUpdater()
 	agent.Run()

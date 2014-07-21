@@ -16,7 +16,7 @@ const (
 )
 
 var (
-	AgentWaitTime = time.Duration(10) * time.Second
+	AgentWaitTime = 50 * time.Millisecond
 )
 
 type Agent struct {
@@ -34,6 +34,10 @@ type Agent struct {
 	leaderchan chan *consulapi.Node
 	connchan   chan *net.TCPConn
 	proxychan  chan *net.TCPConn
+
+	quitupdater chan struct{}
+	quitproxy   chan struct{}
+	quitupresp  chan struct{}
 }
 
 func NewAgent(c *consulapi.Client, bind string, port int, server *http.Server) *Agent {
@@ -50,15 +54,38 @@ func NewAgent(c *consulapi.Client, bind string, port int, server *http.Server) *
 		leaderchan: make(chan *consulapi.Node),
 		connchan:   make(chan *net.TCPConn, 1024),
 		proxychan:  make(chan *net.TCPConn, 1024),
+
+		quitupdater: make(chan struct{}),
+		quitproxy:   make(chan struct{}),
+		quitupresp:  make(chan struct{}),
 	}
+}
+
+func (a *Agent) Quit() {
+	log.Printf("[info] agent called to quit")
+
+	a.quitupdater <- struct{}{}
+	a.quitproxy <- struct{}{}
+
+	a.PubListener.Close()
+	a.WebAppListener.Close()
+
+	<-a.quitupresp
+	log.Printf("[info] agent quit successfully")
 }
 
 func (a *Agent) proxyConns() {
 	for {
 		c, err := a.PubListener.AcceptTCP()
 		if err != nil {
-			log.Printf("[err] failed to accept conn: %s", err)
-			continue
+			select {
+			case <-a.quitproxy:
+				log.Printf("[info] proxy called to quit")
+				return
+			default:
+				log.Printf("[err] failed to accept conn: %s", err)
+				continue
+			}
 		}
 		a.connchan <- c
 	}
@@ -103,7 +130,11 @@ func (a *Agent) Run() {
 
 	for {
 		select {
-		case node := <-a.leaderchan:
+		case node, ok := <-a.leaderchan:
+			if !ok {
+				return
+			}
+
 			log.Printf("[info] received leader node: %s", node)
 
 			if node == nil && a.Leader != nil {
@@ -183,7 +214,9 @@ func (a *Agent) LeaderUpdater() {
 	}
 
 	if a.Session == "" {
-		str, _, err := a.Client.Session().Create(nil, nil)
+		str, _, err := a.Client.Session().Create(&consulapi.SessionEntry{
+			LockDelay: 1000 * time.Nanosecond, // minimum value accepted by consul
+		}, nil)
 		if err != nil {
 			log.Fatalf("[fatal] failed to create session in consul: %s", err)
 		}
@@ -221,6 +254,21 @@ func (a *Agent) LeaderUpdater() {
 				break
 			}
 
+			select {
+			case <-a.quitupdater:
+				log.Printf("[info] called to quit")
+				if string(pair.Value) == nodename && pair.Session != "" { // give up leadership
+					log.Printf("[info] giving up leadership")
+					kv.Release(pair, nil)
+					log.Printf("[info] released leadership successfully")
+				}
+				close(a.leaderchan)
+				a.quitupresp <- struct{}{}
+				log.Printf("[info] updater shutdown complete")
+				return
+			default:
+			}
+
 			if pair.Session == "" {
 				// whoever was no longer is
 				// handle until we get a new leader
@@ -231,6 +279,11 @@ func (a *Agent) LeaderUpdater() {
 				time.Sleep(10 * time.Second)
 				// so we're going to try getting it
 				break
+			}
+
+			if lastindex == meta.LastIndex {
+				// nothing's changed, continue
+				continue
 			}
 
 			if string(pair.Value) != nodename { // non-leaders
